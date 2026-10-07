@@ -163,6 +163,17 @@ module Concurrent
     Job = Struct.new(:action, :args, :executor, :caller)
     private_constant :Job
 
+    # A dispatch held by a {DeferredSendScope} until the enclosing action has
+    # committed its new state.
+    PendingSend = Struct.new(:agent, :action, :args, :executor)
+    private_constant :PendingSend
+
+    # Reported through a deferred-send scope's observable handle when a buffered
+    # dispatch cannot be delivered after the source state has committed. The
+    # source state is never rolled back.
+    DeliveryFailure = Struct.new(:agent, :action, :args, :reason)
+    private_constant :DeliveryFailure
+
     # Raised during action processing or any other time in an Agent's lifecycle.
     class Error < StandardError
       def initialize(message = nil)
@@ -434,6 +445,38 @@ module Concurrent
       true
     end
 
+    # @!visibility private
+    #
+    # Delivers a single dispatch that was buffered by an
+    # {Agent::DeferredSendScope}. Called only after the enclosing action has
+    # committed, so a failure here can never affect or roll back the source
+    # state. Exposed (rather than private) because the buffering scope belongs
+    # to a different Agent instance than the target.
+    #
+    # @return [Symbol] :delivered, :failed (target is failed), or :rejected
+    def dispatch_deferred(action, args, executor)
+      job = nil
+      synchronize do
+        return :failed if failed?
+        job = Job.new(action, args, executor, Thread.current.object_id)
+        return :rejected unless ns_enqueue_job(job, nil, false)
+      end
+
+      # Trigger outside the lock: an immediate executor runs the next job on
+      # this thread and must be able to re-enter the target's lock.
+      posted = executor.post { execute_next_job }
+
+      unless posted
+        # Roll back the enqueue so a rejecting executor cannot wedge the queue.
+        synchronize { @queue.delete(job) }
+        return :rejected
+      end
+
+      :delivered
+    rescue
+      :rejected
+    end
+
     class << self
 
       # Blocks the current thread (indefinitely!) until all actions dispatched
@@ -487,6 +530,58 @@ module Concurrent
 
     private
 
+    # Explicit scope that buffers every Agent dispatch made from the current
+    # thread until the enclosing action has committed. Scopes are thread-local:
+    # dispatches made by other threads or by actions of other Agents running
+    # concurrently never enter this scope.
+    class DeferredSendScope < Synchronization::LockableObject
+      include Concern::Observable
+
+      def initialize
+        super
+        @pending = []
+        self.observers = Collection::CopyOnNotifyObserverSet.new
+      end
+
+      # Buffers one dispatch. Returns the (truthy) enqueue result callers
+      # normally receive; the actual delivery happens only during {#flush}.
+      def buffer(agent, action, args, executor)
+        synchronize { @pending << PendingSend.new(agent, action, args, executor) }
+        true
+      end
+
+      # Discards every buffered dispatch without delivering it. Used when the
+      # enclosing action raises or fails validation.
+      def discard
+        synchronize { @pending.clear }
+        true
+      end
+
+      # Delivers the buffered dispatches in the order they were sent, each
+      # exactly once. Delivery failures never raise; they are reported to
+      # observers as {DeliveryFailure} events.
+      def flush
+        pending = synchronize { @pending.dup }
+        pending.each do |send|
+          result = send.agent.dispatch_deferred(send.action, send.args, send.executor)
+          unless result == :delivered
+            reason = result == :rejected ? 'executor rejected the dispatch' : 'target agent is failed'
+            notify_failure(DeliveryFailure.new(send.agent, send.action, send.args, reason))
+          end
+        end
+        true
+      end
+
+      private
+
+      def notify_failure(failure)
+        observers.notify_observers(Time.now, failure)
+      rescue
+        # a misbehaving observer must not stop the remaining deliveries
+      end
+    end
+    private_constant :DeferredSendScope
+
     def ns_initialize(initial, opts)
       @error_mode    = opts[:error_mode]
       @error_handler = opts[:error_handler]
@@ -507,8 +602,113 @@ module Concurrent
       self.observers = Collection::CopyOnNotifyObserverSet.new
     end
 
+    # Opens an explicit deferred-send scope on the current thread. While the
+    # block runs, every `send`/`send_off`/`send_via` dispatch made from this
+    # thread (directly or through nested calls) is buffered rather than
+    # enqueued immediately. The buffered dispatches are delivered, in order
+    # and exactly once each, only after the block has returned without raising.
+    # If the block raises, or if this scope is nested in an Agent action that
+    # raises or fails validation, all buffered dispatches are discarded.
+    #
+    # When called directly inside an Agent action the buffered dispatches are
+    # held until the action's new state has committed and observers have been
+    # notified, mirroring Clojure agent semantics; an explicit block flush is
+    # not required. Other threads and concurrently running actions of other
+    # Agents are unaffected: scopes are strictly thread-local.
+    #
+    # The returned scope is observable ({Concurrent::Concern::Observable}). It
+    # emits a `(time, failure)` event for each dispatch that cannot be delivered
+    # because the target Agent is {#failed?} or its executor rejects the job. A
+    # delivery failure can never roll back an already committed source state.
+    #
+    # @yield the block during which dispatches are buffered
+    # @return [Concurrent::Agent::DeferredSendScope] the observable scope handle
+    #
+    # @example
+    #   scope = Concurrent::Agent.defer do
+    #     other.send { |v| v + 1 }
+    #   end
+    #   scope.add_observer do |time, failure|
+    #     warn "undelivered send: #{failure.reason}"
+    #   end
+    def self.defer
+      if (scope = current_scope)
+        # Nested calls inherit the enclosing scope rather than creating a
+        # separate buffer, which preserves global send ordering.
+        return scope.tap { yield }
+      end
+
+      scope = DeferredSendScope.new
+      push_scope(scope)
+      owned_by_action = action_context?
+      begin
+        yield
+      rescue
+        scope.discard
+        raise
+      ensure
+        pop_scope unless owned_by_action
+      end
+
+      scope.flush unless owned_by_action
+      scope
+    end
+
+    @scope_stack    = Concurrent::ThreadLocalVar.new(nil)
+    @action_context = Concurrent::ThreadLocalVar.new(nil)
+
+    class << self
+
+      private
+
+      def current_scope
+        stack = @scope_stack.value
+        stack && stack.last
+      end
+
+      def push_scope(scope)
+        (@scope_stack.value ||= []) << scope
+      end
+
+      def pop_scope
+        stack = @scope_stack.value
+        scope = stack.pop if stack
+        @scope_stack.value = nil if stack && stack.empty?
+        scope
+      end
+
+      def action_context?
+        context = @action_context.value
+        !context.nil? && !context.empty?
+      end
+
+      # Marks the beginning of an action on the current thread. Returns the
+      # index into the scope stack at which scopes owned by this action begin.
+      def begin_action_context
+        (@action_context.value ||= []) << (@scope_stack.value ? @scope_stack.length : 0)
+        @action_context.value.last
+      end
+
+      # Ends an action context and returns the scopes it owns. These are
+      # flushed (on commit) or discarded (on failure) by the caller.
+      def end_action_context
+        context = @action_context.value
+        marker  = context.pop
+        @action_context.value = nil if context.empty?
+
+        stack = @scope_stack.value
+        return [] unless stack
+        scopes  = stack[marker..-1] || []
+        @scope_stack.value = marker.zero? ? nil : stack[0...marker]
+        scopes
+      end
+    end
+
     def enqueue_action_job(action, args, executor)
       raise ArgumentError.new('no action given') unless action
+      if (scope = self.class.send(:current_scope))
+        return scope.buffer(self, action, args, executor)
+      end
       job = Job.new(action, args, executor, @caller.value || Thread.current.object_id)
       synchronize { ns_enqueue_job(job) }
     end
@@ -526,13 +726,13 @@ module Concurrent
       end
     end
 
-    def ns_enqueue_job(job, index = nil)
+    def ns_enqueue_job(job, index = nil, trigger = true)
       # a non-nil index means this is an await job
       return false if index.nil? && failed?
       index ||= @queue.length
       @queue.insert(index, job)
       # if this is the only job, post to executor
-      ns_post_next_job if @queue.length == 1
+      ns_post_next_job if trigger && @queue.length == 1
       true
     end
 
@@ -545,24 +745,43 @@ module Concurrent
       old_value = @current.value
 
       @caller.value = job.caller # for nested actions
-      new_value     = job.action.call(old_value, *job.args)
-      @caller.value = nil
+      self.class.send(:begin_action_context)
+      committed    = false
+      await_job    = false
+      begin
+        new_value = job.action.call(old_value, *job.args)
 
-      return if new_value == AWAIT_FLAG
+        if new_value == AWAIT_FLAG
+          await_job = true
+        elsif ns_validate(new_value)
+          @current.value = new_value
+          # Commit the state before any buffered forwarding is flushed.
+          observers.notify_observers(Time.now, old_value, new_value)
+          committed = true
+        else
+          handle_error(ValidationError.new)
+        end
+      rescue => error
+        handle_error(error)
+      ensure
+        deferred_scopes = self.class.send(:end_action_context)
+        @caller.value   = nil
 
-      if ns_validate(new_value)
-        @current.value = new_value
-        observers.notify_observers(Time.now, old_value, new_value)
-      else
-        handle_error(ValidationError.new)
-      end
-    rescue => error
-      handle_error(error)
-    ensure
-      synchronize do
-        @queue.shift
-        unless failed? || @queue.empty?
-          ns_post_next_job
+        synchronize do
+          @queue.shift
+          unless failed? || @queue.empty?
+            ns_post_next_job
+          end
+        end
+
+        if await_job
+          # Await markers carry no state change and no buffered dispatches.
+        elsif committed
+          # Observation has happened; now forward, preserving send order.
+          deferred_scopes.each(&:flush)
+        else
+          # A raised action or rejected validator drops every buffered send.
+          deferred_scopes.each(&:discard)
         end
       end
     end
