@@ -2,6 +2,7 @@ require 'concurrent/atomic/atomic_reference'
 require 'concurrent/collection/copy_on_notify_observer_set'
 require 'concurrent/concern/observable'
 require 'concurrent/synchronization/object'
+require 'concurrent/synchronization/lock'
 
 # @!macro thread_safe_variable_comparison
 #
@@ -88,12 +89,34 @@ module Concurrent
   #
   # Unlike in Clojure, `Atom` cannot participate in {Concurrent::TVar} transactions.
   #
+  # ## Versioned Snapshots
+  #
+  # Comparing only the current value cannot detect an A->B->A sequence of
+  # updates, and re-reading the value before subscribing to observers can
+  # still miss an update happening in between. To close these gaps every
+  # atom carries a monotonically increasing version which is incremented on
+  # every successful commit -- even when the new value is equal to the old
+  # one. Rejected validations and failed compare-and-set operations do not
+  # advance the version. {#snapshot} reads the value and the version
+  # together, and {#wait_for_change} blocks until the version advances past
+  # a previously observed one.
+  #
   # @!macro thread_safe_variable_comparison
   #
   # @see http://clojure.org/atoms Clojure Atoms
   # @see http://clojure.org/state Values and Change - Clojure's approach to Identity and State
   class Atom < Synchronization::Object
     include Concern::Observable
+
+    # A point-in-time snapshot of an {Atom}, pairing the value with the
+    # version at which it was committed. Both are read together so the pair
+    # is always consistent.
+    #
+    # @!attribute [r] value
+    #   @return [Object] the value of the atom at the time of the snapshot
+    # @!attribute [r] version
+    #   @return [Integer] the version of the atom at the time of the snapshot
+    Snapshot = Struct.new(:value, :version)
 
     safe_initialization!
     attr_atomic(:value)
@@ -122,7 +145,48 @@ module Concurrent
       super()
       @Validator     = opts.fetch(:validator, -> v { true })
       self.observers = Collection::CopyOnNotifyObserverSet.new
+      @VersionLock   = Synchronization::Lock.new
+      @version       = 0
       self.value     = value
+    end
+
+    # Reads the current value and the current version together, returning
+    # them as a consistent {Snapshot}. The version is monotonically
+    # increasing: every successful commit (via {#swap}, {#compare_and_set},
+    # or {#reset}) produces a new version, even when the new value is equal
+    # to the old value.
+    #
+    # @return [Snapshot] the current value paired with its version.
+    def snapshot
+      @VersionLock.synchronize { Snapshot.new(value, @version) }
+    end
+
+    # Blocks until the version of the atom advances past the given version,
+    # or until the timeout passes. If the given version is already stale the
+    # current snapshot is returned immediately. Otherwise the wait is
+    # registered atomically with the version check, so no commit can be
+    # missed in between. A timeout only ends this particular wait; it does
+    # not modify the atom in any way. Multiple waiters are all woken by the
+    # same commit, but intermediate values are not retained: the returned
+    # snapshot always reflects the latest commit.
+    #
+    # Since the version advances on every successful commit, this method
+    # also wakes when the value was changed back and forth (A->B->A) or
+    # when a commit stored an equal value.
+    #
+    # @param [Integer] version The version to wait on, usually obtained from
+    #   an earlier {#snapshot}.
+    # @param [Numeric, nil] timeout (nil) Maximum number of seconds to wait,
+    #   `nil` waits without a limit.
+    #
+    # @return [Snapshot] The current snapshot. Its version is greater than
+    #   the given version if a commit was observed, and equal to it if the
+    #   wait timed out.
+    def wait_for_change(version, timeout = nil)
+      @VersionLock.synchronize do
+        @VersionLock.ns_wait_until(timeout) { @version != version }
+        Snapshot.new(value, @version)
+      end
     end
 
     # Atomically swaps the value of atom using the given block. The current
@@ -179,12 +243,18 @@ module Concurrent
     #
     # @return [Boolean] True if the value is changed else false.
     def compare_and_set(old_value, new_value)
-      if valid?(new_value) && compare_and_set_value(old_value, new_value)
-        observers.notify_observers(Time.now, old_value, new_value)
-        true
-      else
-        false
+      return false unless valid?(new_value)
+
+      committed = @VersionLock.synchronize do
+        if compare_and_set_value(old_value, new_value)
+          commit_change
+          true
+        else
+          false
+        end
       end
+      observers.notify_observers(Time.now, old_value, new_value) if committed
+      committed
     end
 
     # Atomically sets the value of atom to the new value without regard for the
@@ -198,7 +268,10 @@ module Concurrent
     def reset(new_value)
       old_value = value
       if valid?(new_value)
-        self.value = new_value
+        @VersionLock.synchronize do
+          self.value = new_value
+          commit_change
+        end
         observers.notify_observers(Time.now, old_value, new_value)
         new_value
       else
@@ -217,6 +290,16 @@ module Concurrent
       @Validator.call(new_value)
     rescue
       false
+    end
+
+    # Records a successful commit: advances the version and wakes all
+    # waiters. Must only be called while holding @VersionLock, after the
+    # new value has been stored. Observers are notified separately, outside
+    # the lock, so observers updating the atom neither deadlock nor let a
+    # stale notification overwrite a newer version.
+    def commit_change
+      @version += 1
+      @VersionLock.ns_broadcast
     end
   end
 end

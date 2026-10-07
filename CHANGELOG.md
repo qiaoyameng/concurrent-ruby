@@ -1,5 +1,12 @@
 ## Current
 
+concurrent-ruby:
+
+* `Concurrent::Atom` now tracks a monotonically increasing version, incremented on every
+  successful commit (even when the new value equals the old one). Added `Atom#snapshot`,
+  reading the value and the version together, and `Atom#wait_for_change(version, timeout)`,
+  which blocks until the version advances past the given one.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:
