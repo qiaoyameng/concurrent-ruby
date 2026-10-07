@@ -1203,6 +1203,364 @@ module Concurrent
       end
     end
 
+    context 'deferred sends' do
+
+      specify 'buffers dispatches made inside an Agent.defer block until commit' do
+        target = Agent.new(0)
+        source = Agent.new(0)
+        order  = []
+
+        source.add_observer(Class.new {
+          define_method(:initialize) { |order| @order = order }
+          define_method(:update) { |*_| @order << [:update] }
+        }.new(order))
+        source.send_via(immediate) do |value|
+          Agent.defer do
+            target.send_via(immediate) { |v| order << [:forward, v]; v + 1 }
+          end
+          order << [:action]
+          value + 1
+        end
+
+        expect(source.value).to eq 1
+        expect(target.value).to eq 1
+        expect(order.map(&:first)).to eq [:action, :update, :forward]
+      end
+
+      specify 'forwards in capture order and delivers each dispatch exactly once' do
+        target  = Agent.new(0)
+        source  = Agent.new(0)
+        seen    = []
+        handle  = nil
+
+        source.send_via(immediate) do |value|
+          handle = Agent.defer do
+            target.send_via(immediate) { |v| seen << v; v + 1 }
+            target.send_via(immediate) { |v| seen << v; v + 1 }
+            target.send_via(immediate) { |v| seen << v; v + 1 }
+          end
+          value
+        end
+
+        expect(seen).to eq [0, 1, 2]
+        expect(target.value).to eq 3
+        expect(handle.delivered_count).to eq 3
+        expect(handle.failed_count).to eq 0
+        expect(handle.total_count).to eq 3
+        expect(handle).to be_delivered
+      end
+
+      specify 'discards buffered dispatches when the action raises' do
+        target = Agent.new(0)
+        source = Agent.new(0)
+        handle = nil
+
+        source.send_via(immediate) do |value|
+          handle = Agent.defer do
+            target.send_via(immediate) { |v| v + 1 }
+            target.send_via(immediate) { |v| v + 1 }
+          end
+          raise 'boom'
+        end
+
+        expect(source).to be_failed
+        expect(source.value).to eq 0
+        expect(target.value).to eq 0
+        expect(handle).to be_discarded
+        expect(handle.sent_count).to eq 0
+        expect(handle.delivered_count).to eq 0
+        expect(handle.failed_count).to eq 0
+        expect(handle.discarded_count).to eq 2
+      end
+
+      specify 'discards buffered dispatches when the validator rejects the new value' do
+        target    = Agent.new(0)
+        validator = ->(value) { value == 0 }
+        source    = Agent.new(0, validator: validator)
+        handle    = nil
+
+        source.send_via(immediate) do |value|
+          handle = Agent.defer do
+            target.send_via(immediate) { |v| v + 1 }
+          end
+          99
+        end
+
+        expect(source.value).to eq 0
+        expect(target.value).to eq 0
+        expect(handle).to be_discarded
+        expect(handle.sent_count).to eq 0
+      end
+
+      specify 'reports a failed target agent as a delivery failure without rolling back the source' do
+        target = Agent.new(0)
+        target.send_via(immediate) { raise 'target is dead' }
+        expect(target).to be_failed
+
+        source = Agent.new(0)
+        handle = nil
+
+        source.send_via(immediate) do |value|
+          handle = Agent.defer do
+            target.send_via(immediate) { |v| v + 1 }
+          end
+          value + 42
+        end
+
+        expect(source.value).to eq 42
+        expect(handle.sent_count).to eq 1
+        expect(handle.delivered_count).to eq 0
+        expect(handle.failed_count).to eq 1
+        failure = handle.failures.first
+        expect(failure).to be_a Agent::DeliveryFailure
+        expect(failure).to be_failed_target
+        expect(failure.target).to eq target
+        expect(failure.reason).to eq :failed_agent
+      end
+
+      specify 'reports an executor rejection as a delivery failure without rolling back the source' do
+        rejected_executor = Concurrent::ImmediateExecutor.new
+        rejected_executor.shutdown
+
+        target = Agent.new(0)
+        source = Agent.new(0)
+        handle = nil
+
+        source.send_via(immediate) do |value|
+          handle = Agent.defer do
+            target.send_via(rejected_executor) { |v| v + 1 }
+          end
+          value + 42
+        end
+
+        expect(source.value).to eq 42
+        expect(target.value).to eq 0
+        expect(handle.failed_count).to eq 1
+        failure = handle.failures.first
+        expect(failure).to be_executor_rejected
+        expect(failure.executor).to eq rejected_executor
+      end
+
+      specify 'preserves order across successful and failed deliveries' do
+        good_target = Agent.new(0)
+        dead_target = Agent.new(0)
+        dead_target.send_via(immediate) { raise 'dead' }
+        source      = Agent.new(0)
+        events      = []
+        handle      = nil
+
+        handle_observer = Class.new {
+          define_method(:initialize) { |events| @events = events }
+          define_method(:update) { |kind, payload| @events << kind }
+        }.new(events)
+
+        source.send_via(immediate) do |value|
+          handle = Agent.defer do
+            good_target.send_via(immediate) { |v| v + 1 }
+            dead_target.send_via(immediate) { |v| v + 1 }
+            good_target.send_via(immediate) { |v| v + 1 }
+          end
+          handle.add_observer(handle_observer)
+          value
+        end
+
+        expect(events).to eq [:delivered, :delivery_failed, :delivered]
+        expect(handle.delivered_count).to eq 2
+        expect(handle.failed_count).to eq 1
+        expect(good_target.value).to eq 2
+      end
+
+      specify 'notifies the handle with :discarded when the action fails' do
+        target = Agent.new(0)
+        source = Agent.new(0)
+        events = []
+        handle = nil
+
+        source.send_via(immediate) do |value|
+          handle = Agent.defer do
+            target.send_via(immediate) { |v| v + 1 }
+          end
+          handle.add_observer(Class.new {
+            define_method(:initialize) { |events| @events = events }
+            define_method(:update) { |kind, payload| @events << kind }
+          }.new(events))
+          raise 'boom'
+        end rescue nil
+
+        expect(events).to eq [:discarded]
+      end
+
+      specify 'inherits the enclosing scope through nested method calls' do
+        target  = Agent.new(0)
+        source  = Agent.new(0)
+        handle  = nil
+
+        forwarder = ->(tgt) do
+          tgt.send_via(immediate) { |v| v + 5 }
+        end
+
+        source.send_via(immediate) do |value|
+          handle = Agent.defer do
+            forwarder.call(target)
+          end
+          value + 1
+        end
+
+        expect(target.value).to eq 5
+        expect(handle.delivered_count).to eq 1
+      end
+
+      specify 'inherits the enclosing scope through a nested action on the same thread' do
+        target = Agent.new(0)
+        source = Agent.new(0)
+        helper = Agent.new(0)
+        handle = nil
+
+        source.send_via(immediate, helper, target) do |value, helper_agent, target_agent|
+          handle = Agent.defer do
+            helper_agent.send_via(immediate) do
+              target_agent.send_via(immediate) { |v| v + 9 }
+              0
+            end
+          end
+          value + 1
+        end
+
+        expect(source.value).to eq 1
+        expect(helper.value).to eq 0
+        expect(target.value).to eq 9
+        expect(handle.total_count).to eq 1
+        expect(handle.delivered_count).to eq 1
+        expect(handle.failed_count).to eq 0
+      end
+
+      specify 'does not capture sends performed by another thread' do
+        target   = Agent.new(0)
+        source   = Agent.new(0)
+        started  = Concurrent::CountDownLatch.new(1)
+        release  = Concurrent::CountDownLatch.new(1)
+        handle   = nil
+
+        thread = Thread.new do
+          started.wait(2)
+          target.send_via(immediate) { |v| v + 1 }
+          release.count_down
+        end
+
+        source.send_via(immediate) do |value|
+          handle = Agent.defer do
+            started.count_down
+            release.wait(2)
+          end
+          value + 1
+        end
+
+        thread.join
+
+        expect(handle.total_count).to eq 0
+        expect(handle.delivered_count).to eq 0
+        expect(target.value).to eq 1
+      end
+
+      specify 'does not mix in actions concurrently executed by another agent' do
+        shared = Agent.new(0)
+        first  = Agent.new(0)
+        second = Agent.new(0)
+
+        first_executor  = Concurrent::SingleThreadExecutor.new
+        second_executor = Concurrent::SingleThreadExecutor.new
+
+        first_inside   = Concurrent::CountDownLatch.new(1)
+        second_proceed = Concurrent::CountDownLatch.new(1)
+
+        handle = nil
+
+        first.send_via(first_executor) do |value|
+          handle = Agent.defer do
+            first_inside.count_down
+            second_proceed.wait(2)
+            shared.send_via(immediate) { |v| v + 100 }
+          end
+          value + 1
+        end
+
+        first_inside.wait(2)
+
+        second.send_via(second_executor) do |value|
+          shared.send_via(immediate) { |v| v + 7 }
+          second_proceed.count_down
+          value + 1
+        end
+
+        expect(first.await_for(2)).to eq true
+        expect(second.await_for(2)).to eq true
+
+        expect(shared.value).to eq 107
+        expect(handle.total_count).to eq 1
+        expect(handle.delivered_count).to eq 1
+      end
+
+      specify 'leaves the original send behavior unchanged outside a defer block' do
+        target = Agent.new(0)
+        target.send_via(immediate) { |v| v + 2 }
+        expect(target.value).to eq 2
+      end
+
+      specify 'forwards immediately when called outside of an agent action' do
+        target = Agent.new(0)
+        handle = Agent.defer do
+          target.send_via(immediate) { |v| v + 3 }
+        end
+
+        expect(target.value).to eq 3
+        expect(handle).to be_delivered
+        expect(handle.sent_count).to eq 1
+      end
+
+      specify 'discards when a standalone defer block raises' do
+        target = Agent.new(0)
+        handle = nil
+
+        expect {
+          Agent.defer do
+            handle = Agent.defer do
+              target.send_via(immediate) { |v| v + 1 }
+            end
+            raise 'standalone boom'
+          end
+        }.to raise_error('standalone boom')
+
+        expect(target.value).to eq 0
+        expect(handle).to be_discarded
+        expect(handle.sent_count).to eq 0
+      end
+
+      specify 'captures send, send_off and send_via dispatches' do
+        fast_target = Agent.new(0)
+        io_target   = Agent.new(0)
+        via_target  = Agent.new(0)
+        source      = Agent.new(0)
+        handle      = nil
+
+        source.send_via(immediate) do |value|
+          handle = Agent.defer do
+            fast_target.send { |v| v + 1 }
+            io_target.send_off { |v| v + 1 }
+            via_target.send_via(immediate) { |v| v + 1 }
+          end
+          value + 1
+        end
+
+        expect(fast_target.await_for(2)).to eq true
+        expect(io_target.await_for(2)).to eq true
+        expect(via_target.await_for(2)).to eq true
+        expect(fast_target.value).to eq 1
+        expect(io_target.value).to eq 1
+        expect(via_target.value).to eq 1
+        expect(handle.delivered_count).to eq 3
+      end
+    end
+
     context :observable do
 
       subject { Agent.new(0) }

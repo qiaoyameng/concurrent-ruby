@@ -4,6 +4,7 @@ require 'concurrent/atomic/count_down_latch'
 require 'concurrent/atomic/thread_local_var'
 require 'concurrent/collection/copy_on_write_observer_set'
 require 'concurrent/concern/observable'
+require 'concurrent/agent/deferred_sends'
 require 'concurrent/synchronization/lockable_object'
 
 module Concurrent
@@ -130,6 +131,40 @@ module Concurrent
   # end
   # ```
   #
+  # ## Deferred Sends
+  #
+  # Normally, a dispatch made from within an action (directly or indirectly)
+  # is enqueued immediately and may execute before the enclosing action has
+  # validated and committed its new state. `Agent.defer` opens an explicit
+  # scope in which all dispatches - to any Agent, using `#send`, `#send_off`,
+  # `#send_via`, or their bang variants - are instead buffered and only
+  # forwarded after the enclosing action has committed its state and notified
+  # its observers:
+  #
+  # ```
+  # target = Concurrent::Agent.new(0)
+  # agent.send do |value|
+  #   handle = Concurrent::Agent.defer do
+  #     target.send { |v| v + 1 }
+  #   end
+  #   value + 1
+  # end
+  # ```
+  #
+  # Buffered dispatches are forwarded in the order they were made and each is
+  # delivered at most once. If the enclosing action raises or its new value is
+  # rejected by the validator, every buffered dispatch is discarded and no
+  # delivery is attempted. A committed source state is never rolled back: when
+  # a target Agent has {#failed?} or its executor rejects the dispatch, that
+  # dispatch is reported as an individual delivery failure on the observable
+  # {DeferredSends} handle returned by `Agent.defer`.
+  #
+  # Nested calls made on the same thread inherit the enclosing scope, while
+  # dispatches from other threads or from actions of other Agents running
+  # concurrently are never captured. Plain dispatches outside a `defer` block
+  # keep their normal behavior. Outside of an action, `Agent.defer` runs the
+  # block and forwards its dispatches immediately.
+  #
   # @!macro agent_await_warning
   #
   #   **NOTE** Never, *under any circumstances*, call any of the "await" methods
@@ -160,8 +195,73 @@ module Concurrent
     DEFAULT_VALIDATOR = ->(value) { true }
     private_constant :DEFAULT_VALIDATOR
 
-    Job = Struct.new(:action, :args, :executor, :caller)
+    Job = Struct.new(:action, :args, :executor, :caller, :deferred)
     private_constant :Job
+
+    # Per-thread stack of the actions currently executing on that thread. A
+    # stack is required because a nested action executed synchronously (for
+    # example via the immediate executor) shares the thread of its enclosing
+    # action.
+    ACTION_CONTEXTS = Concurrent::ThreadLocalVar.new(nil)
+    private_constant :ACTION_CONTEXTS
+
+    # Context carried by the thread which is currently executing an Agent
+    # action. It records every dispatch captured by deferred-send scopes opened
+    # by that action so that nested calls inherit them while threads and other
+    # Agents stay isolated. Entries are appended in capture order; the order is
+    # preserved across nested scopes and used when the action commits.
+    class ActionContext
+      def initialize(barrier = false)
+        @active_scopes = []
+        @entries = []
+        @barrier = barrier
+      end
+
+      def barrier?
+        @barrier
+      end
+
+      def current_scope
+        @active_scopes.last
+      end
+
+      def register_scope(scope)
+        @active_scopes << scope
+      end
+
+      def unregister_scope(scope)
+        @active_scopes.delete(scope)
+      end
+
+      def record(entry)
+        @entries << entry
+      end
+
+      def flush
+        # Iterate by index on a snapshot: delivering an entry may execute the
+        # target action synchronously on this same thread, and that nested
+        # execution must not disturb the traversal state.
+        index = 0
+        while index < @entries.length
+          entry = @entries[index]
+          DeferredScope.deliver_entry(entry)
+          index += 1
+        end
+      ensure
+        @entries.clear
+        @active_scopes.clear
+      end
+
+      def discard
+        @entries.group_by(&:scope).each do |scope, entries|
+          scope.handle.notify_discarded(entries)
+        end
+      ensure
+        @entries.clear
+        @active_scopes.clear
+      end
+    end
+    private_constant :ActionContext
 
     # Raised during action processing or any other time in an Agent's lifecycle.
     class Error < StandardError
@@ -434,6 +534,102 @@ module Concurrent
       true
     end
 
+    # Opens an explicit deferred-send scope. Every "send" dispatch made to any
+    # Agent from within `block` (`#send`, `#send_off`, `#send_via`, and the
+    # bang variants) is buffered instead of being delivered immediately. The
+    # buffered dispatches are only forwarded after the enclosing Agent action
+    # has successfully committed its new state and its observers have been
+    # notified. They are forwarded in the exact order in which they were made
+    # and every dispatch is delivered at most once.
+    #
+    # If the enclosing action raises an exception or if its resulting value is
+    # rejected by the validator, all buffered dispatches are discarded and no
+    # delivery is attempted (the handle reports `#discarded?` and zero
+    # deliveries). Buffering can never roll back the already committed source
+    # state: when the target Agent has {#failed?} or the target executor
+    # rejects the dispatch, delivery fails independently of the source action
+    # and is reported on the returned observable handle via `#delivered` and
+    # `#delivery_failed`.
+    #
+    # Nested calls (directly or through nested Agent actions executed on the
+    # same thread) inherit the enclosing action scope, whereas scopes opened by
+    # other threads or by concurrently executing actions of other Agents are
+    # never mixed in. Regular "send" calls made outside a `defer` block keep
+    # their original behavior.
+    #
+    # When called outside of any Agent action, `block` runs immediately and
+    # its dispatches are forwarded as soon as the block returns.
+    #
+    # @yield scope in which dispatches are deferred
+    # @return [Concurrent::Agent::DeferredSends] observable delivery handle
+    #
+    # @example
+    #   target = Concurrent::Agent.new(0)
+    #   agent.send do |value|
+    #     handle = Concurrent::Agent.defer { target.send { |v| v + 1 } }
+    #     value + 1
+    #   end
+    def self.defer
+      stack = action_context_stack
+
+      if stack.empty?
+        # Outside any action: run the block immediately, then forward.
+        context = ActionContext.new
+        stack << context
+        scope = DeferredScope.new(context)
+        context.register_scope(scope)
+        begin
+          yield
+          context.flush
+        rescue
+          context.discard
+          raise
+        ensure
+          stack.pop
+        end
+        scope.handle
+      else
+        scope = DeferredScope.new(stack.last)
+        stack.last.register_scope(scope)
+        begin
+          yield
+        ensure
+          stack.last.unregister_scope(scope)
+        end
+        scope.handle
+      end
+    end
+
+    def self.action_context_stack
+      ACTION_CONTEXTS.value ||= []
+    end
+    private_class_method :action_context_stack
+
+    def self.push_action_context(barrier = false)
+      context = ActionContext.new(barrier)
+      action_context_stack << context
+      context
+    end
+    private_class_method :push_action_context
+
+    def self.pop_action_context(context)
+      stack = action_context_stack
+      stack.delete(context)
+      ACTION_CONTEXTS.value = nil if stack.empty?
+    end
+    private_class_method :pop_action_context
+
+    def self.current_deferred_scope
+      stack = action_context_stack
+      stack.reverse_each do |context|
+        break if context.barrier?
+        scope = context.current_scope
+        return scope if scope
+      end
+      nil
+    end
+    private_class_method :current_deferred_scope
+
     class << self
 
       # Blocks the current thread (indefinitely!) until all actions dispatched
@@ -509,15 +705,22 @@ module Concurrent
 
     def enqueue_action_job(action, args, executor)
       raise ArgumentError.new('no action given') unless action
-      job = Job.new(action, args, executor, @caller.value || Thread.current.object_id)
-      synchronize { ns_enqueue_job(job) }
+      caller = @caller.value || Thread.current.object_id
+
+      if (scope = self.class.send(:current_deferred_scope))
+        scope.capture_send(self, action, args, executor, caller)
+        true
+      else
+        job = Job.new(action, args, executor, caller, false)
+        synchronize { ns_enqueue_job(job) }
+      end
     end
 
     def enqueue_await_job(latch)
       synchronize do
         if (index = ns_find_last_job_for_thread)
           job = Job.new(AWAIT_ACTION, [latch], Concurrent.global_immediate_executor,
-                        Thread.current.object_id)
+                        Thread.current.object_id, false)
           ns_enqueue_job(job, index+1)
         else
           latch.count_down
@@ -540,30 +743,64 @@ module Concurrent
       @queue.first.executor.post { execute_next_job }
     end
 
+    # Forwards one dispatch buffered by an Agent.defer scope after the source
+    # state has committed. Never raises: the committed source state cannot be
+    # rolled back, so a rejected dispatch is reported to the delivery handle
+    # instead.
+    def deliver_deferred_job(job)
+      accepted = synchronize do
+        break :failed_agent if failed?
+        @queue << job
+        if @queue.length == 1
+          break :executor_rejected unless ns_post_next_job
+        end
+        true
+      end
+      accepted == true ? :ok : accepted
+    end
+
     def execute_next_job
       job       = synchronize { @queue.first }
       old_value = @current.value
+      context   = self.class.send(:push_action_context, job.deferred)
+      outcome   = nil
 
-      @caller.value = job.caller # for nested actions
-      new_value     = job.action.call(old_value, *job.args)
-      @caller.value = nil
+      begin
+        @caller.value = job.caller # for nested actions
+        new_value     = job.action.call(old_value, *job.args)
+        @caller.value = nil
 
-      return if new_value == AWAIT_FLAG
-
-      if ns_validate(new_value)
-        @current.value = new_value
-        observers.notify_observers(Time.now, old_value, new_value)
-      else
-        handle_error(ValidationError.new)
-      end
-    rescue => error
-      handle_error(error)
-    ensure
-      synchronize do
-        @queue.shift
-        unless failed? || @queue.empty?
-          ns_post_next_job
+        if new_value == AWAIT_FLAG
+          outcome = :await
+        elsif ns_validate(new_value)
+          @current.value = new_value
+          observers.notify_observers(Time.now, old_value, new_value)
+          outcome = :committed
+        else
+          handle_error(ValidationError.new)
+          outcome = :failed
         end
+      rescue => error
+        @caller.value = nil
+        handle_error(error)
+        outcome = :failed
+      ensure
+        # Remove this job from the queue and schedule the next one before the
+        # buffered dispatches are flushed: a flush may execute target actions
+        # synchronously (on the immediate executor) on this same thread, and
+        # those nested executions must not see this job as the queue head.
+        post_next_job = synchronize do
+          @queue.shift
+          !failed? && !@queue.empty?
+        end
+        ns_post_next_job if post_next_job
+
+        if outcome == :committed
+          context.flush
+        elsif outcome == :failed
+          context.discard
+        end
+        self.class.send(:pop_action_context, context)
       end
     end
 

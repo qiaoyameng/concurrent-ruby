@@ -1,5 +1,9 @@
 ## Current
 
+concurrent-ruby:
+
+* Add `Concurrent::Agent.defer`, an explicit deferred-send scope that buffers dispatches made by an Agent action until after the action commits its state; buffered dispatches are discarded when the action fails, delivered in order, and post-commit delivery failures (failed target Agent or rejected executor) are reported on an observable handle.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:
