@@ -12,6 +12,7 @@ module Concurrent
 
   autoload :Options, 'concurrent/options'
   autoload :TimerSet, 'concurrent/executor/timer_set'
+  autoload :ManualTimerSet, 'concurrent/executor/manual_timer_set'
   autoload :ThreadPoolExecutor, 'concurrent/executor/thread_pool_executor'
 
   # @!visibility private

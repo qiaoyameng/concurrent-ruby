@@ -194,6 +194,9 @@ module Concurrent
     #     between executions, can be either :fixed_rate or :fixed_delay.
     #     (default: :fixed_delay)
     #   @option opts [Executor] executor, default is `global_io_executor`
+    #   @option opts [TimerSet] :timer_set the timer set used to schedule the
+    #     task executions, default is `Concurrent.global_timer_set`. Pass a
+    #     `ManualTimerSet` to drive the task with a virtual clock in tests.
     #
     #   @!macro deref_options
     #
@@ -310,6 +313,7 @@ module Concurrent
       @interval_type = opts[:interval_type] || DEFAULT_INTERVAL_TYPE
       @task = Concurrent::SafeTaskExecutor.new(task)
       @executor = opts[:executor] || Concurrent.global_io_executor
+      @timer_set = opts[:timer_set] || Concurrent.global_timer_set
       @running = Concurrent::AtomicBoolean.new(false)
       @age = Concurrent::AtomicFixnum.new(0)
       @value = nil
@@ -331,7 +335,7 @@ module Concurrent
 
     # @!visibility private
     def schedule_next_task(interval = execution_interval)
-      ScheduledTask.execute(interval, executor: @executor, args: [Concurrent::Event.new, @age.value], &method(:execute_task))
+      ScheduledTask.execute(interval, executor: @executor, timer_set: @timer_set, args: [Concurrent::Event.new, @age.value], &method(:execute_task))
       nil
     end
 
@@ -340,7 +344,7 @@ module Concurrent
       return nil unless @running.true?
       return nil unless @age.value == age_when_scheduled
 
-      start_time = Concurrent.monotonic_time
+      start_time = monotonic_time
       _success, value, reason = @task.execute(self)
       if completion.try?
         self.value = value
@@ -356,10 +360,25 @@ module Concurrent
     # @!visibility private
     def calculate_next_interval(start_time)
       if @interval_type == FIXED_RATE
-        run_time = Concurrent.monotonic_time - start_time
+        run_time = monotonic_time - start_time
         [execution_interval - run_time, 0].max
       else # FIXED_DELAY
         execution_interval
+      end
+    end
+
+    # The current monotonic time, as reported by the timer set when it
+    # provides its own clock (e.g. `ManualTimerSet`), else the application
+    # monotonic clock.
+    #
+    # @return [Float] the current monotonic time
+    #
+    # @!visibility private
+    def monotonic_time
+      if @timer_set.respond_to?(:monotonic_time, true)
+        @timer_set.send(:monotonic_time)
+      else
+        Concurrent.monotonic_time
       end
     end
   end
