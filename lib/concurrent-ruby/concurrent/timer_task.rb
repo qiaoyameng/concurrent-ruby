@@ -194,6 +194,10 @@ module Concurrent
     #     between executions, can be either :fixed_rate or :fixed_delay.
     #     (default: :fixed_delay)
     #   @option opts [Executor] executor, default is `global_io_executor`
+    #   @option opts [TimerSet] :timer_set the timer set used to schedule the
+    #     recurring executions, default is `global_timer_set`. A
+    #     {Concurrent::ManualTimerSet} can be given to drive the executions
+    #     with a virtual clock, e.g. in tests.
     #
     #   @!macro deref_options
     #
@@ -310,6 +314,7 @@ module Concurrent
       @interval_type = opts[:interval_type] || DEFAULT_INTERVAL_TYPE
       @task = Concurrent::SafeTaskExecutor.new(task)
       @executor = opts[:executor] || Concurrent.global_io_executor
+      @timer_set = opts[:timer_set]
       @running = Concurrent::AtomicBoolean.new(false)
       @age = Concurrent::AtomicFixnum.new(0)
       @value = nil
@@ -331,7 +336,9 @@ module Concurrent
 
     # @!visibility private
     def schedule_next_task(interval = execution_interval)
-      ScheduledTask.execute(interval, executor: @executor, args: [Concurrent::Event.new, @age.value], &method(:execute_task))
+      opts = { executor: @executor, args: [Concurrent::Event.new, @age.value] }
+      opts[:timer_set] = @timer_set if @timer_set
+      ScheduledTask.execute(interval, opts, &method(:execute_task))
       nil
     end
 
@@ -340,7 +347,7 @@ module Concurrent
       return nil unless @running.true?
       return nil unless @age.value == age_when_scheduled
 
-      start_time = Concurrent.monotonic_time
+      start_time = monotonic_time
       _success, value, reason = @task.execute(self)
       if completion.try?
         self.value = value
@@ -356,10 +363,23 @@ module Concurrent
     # @!visibility private
     def calculate_next_interval(start_time)
       if @interval_type == FIXED_RATE
-        run_time = Concurrent.monotonic_time - start_time
+        run_time = monotonic_time - start_time
         [execution_interval - run_time, 0].max
       else # FIXED_DELAY
         execution_interval
+      end
+    end
+
+    # The current monotonic time as seen by the timer set the recurring
+    # executions are scheduled on. Falls back to the global monotonic clock
+    # when the timer set does not track its own time.
+    #
+    # @!visibility private
+    def monotonic_time
+      if @timer_set && @timer_set.respond_to?(:monotonic_time)
+        @timer_set.monotonic_time
+      else
+        Concurrent.monotonic_time
       end
     end
   end

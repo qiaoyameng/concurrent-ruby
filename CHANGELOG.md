@@ -1,5 +1,13 @@
 ## Current
 
+concurrent-ruby:
+
+* Add `Concurrent::ManualTimerSet`, a deterministic manually-driven timer set
+  for tests. It keeps a virtual monotonic clock advanced via `#advance_to`,
+  runs due tasks in schedule/registration order without any background
+  threads, and can be injected into `ScheduledTask` and `TimerTask` through
+  the `:timer_set` option.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

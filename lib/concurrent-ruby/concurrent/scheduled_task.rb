@@ -311,8 +311,24 @@ module Concurrent
     # @!visibility private
     def ns_schedule(delay)
       @delay = delay
-      @time = Concurrent.monotonic_time + @delay
+      @time = ns_parent_time + @delay
       @parent.send(:post_task, self)
+    end
+
+    # The current monotonic time as seen by the timer set this task is
+    # scheduled on. Timer sets which track their own time (such as
+    # `ManualTimerSet`) expose it through a `monotonic_time` method; all
+    # other timer sets keep using the global monotonic clock.
+    #
+    # @return [Float] the current monotonic time
+    #
+    # @!visibility private
+    def ns_parent_time
+      if @parent.respond_to?(:monotonic_time)
+        @parent.monotonic_time
+      else
+        Concurrent.monotonic_time
+      end
     end
 
     # Reschedule the task using the given delay and the current time.
